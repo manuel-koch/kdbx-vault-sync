@@ -5,7 +5,7 @@
 #
 # Design (safer than a bidirectional sync that picks "newer wins"):
 #   - Only top-level *.kdbx / *.keyx files are synced, file-by-file via
-#     `rclone copyto` — no recursive directory sync, so logs, scripts, the
+#     `run_rclone copyto` — no recursive directory sync, so logs, scripts, the
 #     .app bundle and this state never travel over the wire.
 #   - Per file, each run compares the current state against the state recorded
 #     at the last successful sync (the "baseline"):
@@ -63,13 +63,13 @@
 #   Stop (perm.):   ... bootout ... && rm ~/Library/LaunchAgents/com.user.kdbx-vault-sync.<hash>.plist
 #
 # --- Commands (in workflow order) -------------------------------------
-#   ./kdbx-vault-sync.sh init           create .kdbx-vault-sync.conf interactively (if
+#   ./kdbx-vault-sync.sh init      create .kdbx-vault-sync.conf interactively (if
 #                                  missing); add NEW vault files to the state
 #                                  without touching existing baselines.
 #                                  'init full' re-records ALL baselines (use
 #                                  only after manual reconciliation)
-#   ./kdbx-vault-sync.sh status         show change state of every vault file
-#   ./kdbx-vault-sync.sh                one sync run (push/pull/conflict detection;
+#   ./kdbx-vault-sync.sh status    show change state of every vault file
+#   ./kdbx-vault-sync.sh           one sync run (push/pull/conflict detection;
 #                                  this is what launchd executes every 60s)
 #   ./kdbx-vault-sync.sh resolve FILE   after a CONFLICT and manual merge in
 #                                  KeePassXC: push the merged file and adopt
@@ -77,7 +77,16 @@
 #   ./kdbx-vault-sync.sh remove FILE stop syncing FILE: backs up local+remote
 #                                  copies, deletes the remote file, drops the
 #                                  state entry. Local file is NOT deleted.
-#   ./kdbx-vault-sync.sh init-app       build the launchd .app launcher
+#   ./kdbx-vault-sync.sh pause     stop the scheduled sync: the launchd job is
+#                                  unloaded (no further runs fire). A run that
+#                                  is already in progress is NOT interrupted —
+#                                  it finishes on its own. Nothing is deleted;
+#                                  a marker file records the paused state.
+#   ./kdbx-vault-sync.sh resume    restart the scheduled sync after 'pause':
+#                                  removes the paused marker, reloads the
+#                                  launchd job, and a sync run fires
+#                                  immediately (RunAtLoad), then every 60s.
+#   ./kdbx-vault-sync.sh init-app  build the launchd .app launcher
 #   ./kdbx-vault-sync.sh init-background register the launchd job (see "Managing
 #                                  the launchd job" above to stop/resume)
 # ---------------------------------------------------------------------
@@ -139,6 +148,12 @@ LAUNCHD_PLIST_PATH="${HOME}/Library/LaunchAgents/${LAUNCHD_JOB_NAME}.plist"
 
 STATE_FILE_PATH="${SCRIPT_DIR}/.kdbx-vault-sync.state"
 LOCAL_BACKUP_DIR="${SCRIPT_DIR}/.kdbx-vault-sync-backups"
+PAUSED_FLAG_PATH="${SCRIPT_DIR}/.kdbx-vault-sync.paused"
+
+# Re-alert interval for persistent problems (conflicts, failures). An unset
+# variable would evaluate as 0 in zsh arithmetic and re-alert on EVERY run,
+# so a sane default is mandatory here.
+REMINDER_INTERVAL_SECONDS="${REMINDER_INTERVAL_SECONDS:-14400}"   # 4 hours
 
 # ---------------------------------------------------------------- helpers
 
@@ -217,19 +232,80 @@ compute_local_hash() {
     fi
 }
 
-# Print "<size>|<mtime>" for a remote file, or "|" if it does not exist.
+# Run an rclone command, writing rclone's stderr into the log file (timestamped,
+# prefixed "rclone:") so remote/transfer output leaves a trace instead of being
+# silently discarded. stdout is passed through unchanged; the return value is
+# rclone's exit code. The log lines are written to STDERR, so capturing
+# run_rclone's stdout in $(...) never mixes log lines into the captured value.
+run_rclone() {
+    local rclone_stderr_file rclone_line rclone_rc
+    rclone_stderr_file=$(mktemp "${TMPDIR:-/tmp}/kdbx-vault-sync.rclone.XXXXXX")
+    if [ -n "${rclone_stderr_file}" ]; then
+        rclone "$@" 2>"${rclone_stderr_file}"
+        rclone_rc=$?
+        while IFS= read -r rclone_line; do
+            # Skip the recurring host-key NOTICE — pure noise at a 60s run interval.
+            # Silence it permanently by setting known_hosts_file=none on the remote.
+            [[ "${rclone_line}" == *"No host key validation is being performed"* ]] && continue
+            [ -z "${rclone_line}" ] && continue
+            log_message "rclone: ${rclone_line}" >&2
+        done < "${rclone_stderr_file}"
+        rm -f "${rclone_stderr_file}"
+    else
+        # No temp file available — let stderr flow into the script's own stderr
+        # (which the .app launcher/launchd already route into the log file).
+        rclone "$@"
+        rclone_rc=$?
+    fi
+    return "${rclone_rc}"
+}
+
+# Print "<size>|<mtime>" for a remote file, "|" if it does not exist, or
+# "ERROR" if the remote could not be queried at all. The distinction matters:
+# a failed query must NEVER be interpreted as "the file was deleted".
+# The whole vault dir is listed instead of the single file, because lsjson on
+# a missing FILE exits non-zero just like an unreachable remote does — a
+# successful listing that simply lacks the entry is the only reliable
+# "file does not exist" answer.
 fetch_remote_stat() {
-    local remote_path="$1"
-    rclone lsjson "${REMOTE_ALIAS}${remote_path}" 2>/dev/null | python3 -c '
+    local vault_file_name="$1" listing_json
+    if ! listing_json=$(run_rclone lsjson "${REMOTE_ALIAS}"); then
+        echo "ERROR"
+        return 0
+    fi
+    printf '%s' "${listing_json}" | python3 -c '
 import json, sys
+name = sys.argv[1]
 try:
     entries = json.load(sys.stdin)
 except Exception:
     entries = []
-if entries:
-    print(str(entries[0]["Size"]) + "|" + str(entries[0]["ModTime"]))
+for entry in entries:
+    if not entry.get("IsDir") and entry["Name"] == name:
+        print(str(entry["Size"]) + "|" + str(entry["ModTime"]))
+        break
 else:
-    print("|")'
+    print("|")' "${vault_file_name}"
+}
+
+# fetch_remote_stat with retries — used right after a successful transfer,
+# when the remote was demonstrably reachable moments ago. Never returns
+# "ERROR": if the stat cannot be re-read, it falls back to "|" — that makes
+# the next run take the PULL path, which pulls the (identical) content and
+# repairs the baseline, instead of leaving a corrupt "ERROR" entry in the
+# state file (which would look like "both sides changed" -> false CONFLICT).
+refresh_baseline_remote_stat() {
+    local remote_stat attempt
+    for attempt in 1 2 3; do
+        remote_stat=$(fetch_remote_stat "$1")
+        [ "${remote_stat}" != "ERROR" ] && break
+        [ "${attempt}" -lt 3 ] && sleep 2
+    done
+    if [ "${remote_stat}" = "ERROR" ]; then
+        log_message "WARN: could not re-read the remote stat for $1 after transfer — writing a placeholder baseline; the next run will self-heal it via a content-identical pull" >&2
+        remote_stat="|"
+    fi
+    print -- "${remote_stat}"
 }
 
 # Print the raw baseline state entry "<name>|<hash>|<size>|<mtime>", if present.
@@ -310,10 +386,16 @@ cmd_init() {
             # (safe) mode its baseline stays untouched — a stale baseline for a
             # file whose remote changed would silently mask a divergence.
             if [ "${INIT_MODE}" = "full" ]; then
+                local full_init_remote_stat
+                full_init_remote_stat=$(fetch_remote_stat "${vault_file_name}")
+                if [ "${full_init_remote_stat}" = "ERROR" ]; then
+                    log_message "ERROR: could not query the remote for ${vault_file_name} — baseline NOT re-recorded (re-run 'init full' when the remote is reachable)"
+                    continue
+                fi
                 write_state_entry \
                     "${vault_file_name}" \
                     "$(compute_local_hash "${vault_file_path}")" \
-                    "$(fetch_remote_stat "${vault_file_name}")"
+                    "${full_init_remote_stat}"
                 log_message "init: ${vault_file_name} baseline re-recorded (full init)"
                 updated_count=$((updated_count+1))
             fi
@@ -321,10 +403,16 @@ cmd_init() {
             # Unknown file: record its baseline. If a remote copy exists, the
             # local file becomes the authority (it exists locally; a remote
             # divergence for a never-synced file is resolved by KeePassXC).
+            local new_file_remote_stat
+            new_file_remote_stat=$(fetch_remote_stat "${vault_file_name}")
+            if [ "${new_file_remote_stat}" = "ERROR" ]; then
+                log_message "ERROR: could not query the remote for ${vault_file_name} — file NOT added to the state (re-run init when the remote is reachable)"
+                continue
+            fi
             write_state_entry \
                 "${vault_file_name}" \
                 "$(compute_local_hash "${vault_file_path}")" \
-                "$(fetch_remote_stat "${vault_file_name}")"
+                "${new_file_remote_stat}"
             log_message "init: ${vault_file_name} baseline recorded (new file)"
             added_count=$((added_count+1))
         fi
@@ -344,6 +432,10 @@ cmd_status() {
     local baseline_local_hash baseline_remote_stat
     local local_state remote_state
     printf "%-40s %-12s %-12s\n" "FILE" "LOCAL" "REMOTE"
+    if [ -e "${PAUSED_FLAG_PATH}" ]; then
+        print "NOTE: schedule is PAUSED ($(cat "${PAUSED_FLAG_PATH}")) — resume with './kdbx-vault-sync.sh resume'"
+        print ""
+    fi
     while IFS= read -r vault_file_path; do
         vault_file_name=$(basename "${vault_file_path}")
         current_local_hash=$(compute_local_hash "${vault_file_path}")
@@ -357,7 +449,11 @@ cmd_status() {
             baseline_local_hash="${state_remainder%%|*}"
             baseline_remote_stat="${state_remainder#*|}"
             [ "${current_local_hash}" != "${baseline_local_hash}" ] && local_state="CHANGED"
-            [ "${current_remote_stat}" != "${baseline_remote_stat}" ] && remote_state="CHANGED"
+            if [ "${current_remote_stat}" = "ERROR" ]; then
+                remote_state="UNKNOWN"
+            elif [ "${current_remote_stat}" != "${baseline_remote_stat}" ]; then
+                remote_state="CHANGED"
+            fi
         fi
         has_conflict_marker "${vault_file_path}" && local_state="CONFLICT"
 
@@ -394,6 +490,10 @@ cmd_run() {
     # a function-local variable would be out of scope when the trap runs.
     trap "rmdir '${lock_file}' 2>/dev/null" EXIT INT TERM
 
+    if [ -e "${PAUSED_FLAG_PATH}" ]; then
+        log_message "NOTE: schedule is paused ($(cat "${PAUSED_FLAG_PATH}")) — this is a manual run."
+    fi
+
     if [ ! -s "${STATE_FILE_PATH}" ]; then
         log_message "ERROR: no state file — run './kdbx-vault-sync.sh init' first."
         notify_once "state-missing" "Vault Sync not initialized — run init"
@@ -403,16 +503,20 @@ cmd_run() {
     local vault_file_path vault_file_name state_entry
     local baseline_local_hash baseline_remote_stat
     local current_local_hash current_remote_stat
-    local conflict_marker_path
+    local conflict_marker_path confirm_remote_stat
     local failure_count=0 conflict_count=0 unchanged_count=0 transferred_count=0
 
     # Orphaned state entries: the state tracks a file that no longer exists
     # locally. Do NOT delete or restore anything automatically — alert instead
     # and let the user decide (re-create the file, or run `remove FILE`).
-    local orphan_line orphan_name missing_count=0
+    local orphan_line orphan_name orphan_remote_stat missing_count=0
     while IFS= read -r orphan_line; do
         orphan_name="${orphan_line%%|*}"
         if [ ! -e "${SCRIPT_DIR}/${orphan_name}" ]; then
+            # If the remote cannot be queried, stay silent: the file might
+            # only be re-listed once the remote is reachable again.
+            orphan_remote_stat=$(fetch_remote_stat "${orphan_name}")
+            [ "${orphan_remote_stat}" = "ERROR" ] && continue
             log_message "WARN: ${orphan_name} is tracked but has been deleted locally. The remote copy is kept. Restore the file, or run './kdbx-vault-sync.sh remove ${orphan_name}' to remove it from syncing."
             notify_once "${orphan_name}-locally-deleted" \
                 "Vault Sync: ${orphan_name} was deleted locally but is still synced to the remote. Restore the file, or run './kdbx-vault-sync.sh remove ${orphan_name}' to remove it from syncing."
@@ -424,8 +528,12 @@ cmd_run() {
     # locally nor in the state was created by ANOTHER HOST. Pull it down —
     # this cannot overwrite anything (no local copy exists) — record the
     # baseline from the pulled content, and alert so the arrival is visible.
-    local remote_listing remote_entry remote_name
-    remote_listing=$(rclone lsjson "${REMOTE_ALIAS}" 2>/dev/null | python3 -c '
+    local remote_listing remote_entry remote_name remote_listing_json
+    remote_listing_json=""
+    if ! remote_listing_json=$(run_rclone lsjson "${REMOTE_ALIAS}"); then
+        log_message "WARN: could not list the remote — skipping remote-only file adoption this run"
+    fi
+    remote_listing=$(printf '%s' "${remote_listing_json}" | python3 -c '
 import json, sys
 try:
     entries = json.load(sys.stdin)
@@ -445,11 +553,11 @@ for e in entries:
         fi
         log_message "adopting remote-only file ${remote_name} (created on another host) — pulling"
         mkdir -p "${LOCAL_BACKUP_DIR}"
-        if rclone copyto "${REMOTE_ALIAS}${remote_name}" "${SCRIPT_DIR}/${remote_name}"; then
+        if run_rclone copyto "${REMOTE_ALIAS}${remote_name}" "${SCRIPT_DIR}/${remote_name}"; then
             write_state_entry \
                 "${remote_name}" \
                 "$(compute_local_hash "${SCRIPT_DIR}/${remote_name}")" \
-                "$(fetch_remote_stat "${remote_name}")"
+                "$(refresh_baseline_remote_stat "${remote_name}")"
             log_message "ADOPTED: ${remote_name} pulled from ${REMOTE_ALIAS} and added to sync"
             notify_once "${remote_name}-adopted" \
                 "Vault Sync: new file ${remote_name} arrived from another host and was added to this vault's sync."
@@ -481,6 +589,16 @@ for e in entries:
         current_local_hash=$(compute_local_hash "${vault_file_path}")
         current_remote_stat=$(fetch_remote_stat "${vault_file_name}")
 
+        # A failed remote query is NOT "the file was deleted" — treat it like
+        # any other transient failure and retry on the next run.
+        if [ "${current_remote_stat}" = "ERROR" ]; then
+            log_message "ERROR: could not query the remote for ${vault_file_name} — skipping this file this run"
+            notify_once "${vault_file_name}-remote-error" \
+                "Vault Sync: could not reach the remote to check ${vault_file_name} — will retry"
+            failure_count=$((failure_count+1))
+            continue
+        fi
+
         if has_conflict_marker "${vault_file_path}"; then
             log_message "CONFLICT unresolved: ${vault_file_name} (merge in KeePassXC, then: ./kdbx-vault-sync.sh resolve ${vault_file_name})"
             conflict_count=$((conflict_count+1))
@@ -502,7 +620,7 @@ for e in entries:
                 # Back up the remote version, but only if its content actually
                 # differs from what we are about to push (avoid no-op backups).
                 local remote_backup_needed=1
-                if rclone copyto \
+                if run_rclone copyto \
                         "${REMOTE_ALIAS}${vault_file_name}" \
                         "${LOCAL_BACKUP_DIR}/.remote-probe_${vault_file_name}"; then
                     if [ "$(compute_local_hash "${LOCAL_BACKUP_DIR}/.remote-probe_${vault_file_name}")" \
@@ -512,7 +630,7 @@ for e in entries:
                     rm -f "${LOCAL_BACKUP_DIR}/.remote-probe_${vault_file_name}"
                 fi
                 if [ "${remote_backup_needed}" = 1 ]; then
-                    if rclone copyto \
+                    if run_rclone copyto \
                             "${REMOTE_ALIAS}${vault_file_name}" \
                             "${REMOTE_BACKUP_ROOT}/$(timestamp)_${vault_file_name}"; then
                         log_message "backed up remote ${vault_file_name}"
@@ -523,12 +641,12 @@ for e in entries:
                     fi
                 fi
             fi
-            if rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
+            if run_rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
                 # Baseline must reflect the NEW remote state after the push.
                 write_state_entry \
                     "${vault_file_name}" \
                     "${current_local_hash}" \
-                    "$(fetch_remote_stat "${vault_file_name}")"
+                    "$(refresh_baseline_remote_stat "${vault_file_name}")"
                 log_message "PUSH ok: ${vault_file_name} -> ${REMOTE_ALIAS}"
                 transferred_count=$((transferred_count+1))
                 clear_notification_flag "${vault_file_name}"
@@ -547,14 +665,26 @@ for e in entries:
             if [ "${current_remote_stat}" = "|" ]; then
                 # Remote file was deleted; the local copy is the only remaining
                 # version, so restore it to the remote (never delete local).
-                log_message "remote ${vault_file_name} was deleted — pushing local copy back (deletion not propagated)"
+                # A deletion claim this consequential must not rest on a single
+                # observation: re-query once, and only act if the file is STILL
+                # reported as missing.
+                confirm_remote_stat=$(fetch_remote_stat "${vault_file_name}")
+                if [ "${confirm_remote_stat}" != "|" ]; then
+                    if [ "${confirm_remote_stat}" = "ERROR" ]; then
+                        log_message "WARN: remote ${vault_file_name} looked missing, but the re-check failed — skipping this run (no action taken)"
+                    else
+                        log_message "WARN: remote ${vault_file_name} looked missing, but was visible again on re-check — skipping (transient remote state)"
+                    fi
+                    continue
+                fi
+                log_message "remote ${vault_file_name} was deleted (confirmed by re-check) — pushing local copy back (deletion not propagated)"
                 notify_once "${vault_file_name}-remote-deleted" \
                     "Vault Sync: ${vault_file_name} was deleted on the remote but still exists locally. The local copy was pushed back to the remote. To remove the file from syncing on ALL hosts, delete it locally and run: ./kdbx-vault-sync.sh remove ${vault_file_name}"
-                if rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
+                if run_rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
                     write_state_entry \
                         "${vault_file_name}" \
                         "${current_local_hash}" \
-                        "$(fetch_remote_stat "${vault_file_name}")"
+                        "$(refresh_baseline_remote_stat "${vault_file_name}")"
                     transferred_count=$((transferred_count+1))
                     clear_notification_flag "${vault_file_name}"
                 else
@@ -574,7 +704,7 @@ for e in entries:
                         log_message "backed up local ${vault_file_name}"
                     fi
                 fi
-                if rclone copyto "${REMOTE_ALIAS}${vault_file_name}" "${vault_file_path}"; then
+                if run_rclone copyto "${REMOTE_ALIAS}${vault_file_name}" "${vault_file_path}"; then
                     local pulled_local_hash
                     pulled_local_hash=$(compute_local_hash "${vault_file_path}")
                     write_state_entry \
@@ -604,8 +734,8 @@ for e in entries:
             mkdir -p "${LOCAL_BACKUP_DIR}"
             [ -n "${current_local_hash}" ] && \
                 cp -p "${vault_file_path}" "${LOCAL_BACKUP_DIR}/$(timestamp)_local_${vault_file_name}"
-            [ "${current_remote_stat}" != "|" ] && \
-                rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
+            [ "${current_remote_stat}" != "|" ] && [ "${current_remote_stat}" != "ERROR" ] && \
+                run_rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
                               "${REMOTE_BACKUP_ROOT}/$(timestamp)_remote_${vault_file_name}"
             {
                 echo "CONFLICT on ${vault_file_name} detected $(date)"
@@ -650,12 +780,16 @@ cmd_resolve() {
     # The local file is the freshly merged one. Back up the remote version,
     # push the merge, clear the conflict.
     current_remote_stat=$(fetch_remote_stat "${vault_file_name}")
+    if [ "${current_remote_stat}" = "ERROR" ]; then
+        log_message "ERROR: could not query the remote — resolve aborted, conflict marker kept."
+        exit 1
+    fi
     if [ "${current_remote_stat}" != "|" ]; then
-        rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
+        run_rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
                       "${REMOTE_BACKUP_ROOT}/$(timestamp)_preresolve_${vault_file_name}"
     fi
     merged_local_hash=$(compute_local_hash "${vault_file_path}")
-    if rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
+    if run_rclone copyto "${vault_file_path}" "${REMOTE_ALIAS}${vault_file_name}"; then
         write_state_entry \
             "${vault_file_name}" \
             "${merged_local_hash}" \
@@ -698,10 +832,10 @@ cmd_remove() {
     # 2. Back up and delete the remote copy, if any.
     current_remote_stat=$(fetch_remote_stat "${vault_file_name}")
     if [ "${current_remote_stat}" != "|" ]; then
-        if rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
+        if run_rclone copyto "${REMOTE_ALIAS}${vault_file_name}" \
                          "${REMOTE_BACKUP_ROOT}/$(timestamp)_remote-pre-remove_${vault_file_name}"; then
             log_message "backed up remote ${vault_file_name}"
-            if rclone delete "${REMOTE_ALIAS}${vault_file_name}"; then
+            if run_rclone delete "${REMOTE_ALIAS}${vault_file_name}"; then
                 log_message "deleted remote ${vault_file_name}"
             else
                 log_message "ERROR: could not delete remote ${vault_file_name} — state entry kept, re-run 'remove ${vault_file_name}' later."
@@ -808,6 +942,47 @@ LAUNCHD_PLIST
     exit 0
 }
 
+# Pause the scheduled sync: unload the launchd job (no further scheduled runs
+# fire) and drop a marker file so the paused state survives reboots and is
+# visible in `status`/manual runs. A run that is already in progress is NOT
+# interrupted — killing it could cut a transfer or a state write mid-flight —
+# it simply finishes on its own. Nothing is deleted; `resume` restores the
+# exact previous setup.
+cmd_pause() {
+    if launchctl print "${LAUNCHD_JOB_ID}" >/dev/null 2>&1; then
+        launchctl bootout "${LAUNCHD_JOB_ID}" 2>/dev/null
+        log_message "PAUSED: launchd job ${LAUNCHD_JOB_NAME} unloaded — no further scheduled runs fire."
+    else
+        log_message "PAUSED: launchd job ${LAUNCHD_JOB_NAME} was not loaded (nothing to unload)."
+    fi
+    # Report (do not kill) a run that is currently in progress: it may be
+    # mid-transfer or mid-state-write, and interrupting it is exactly what
+    # pause must never do. It completes normally and releases its own lock.
+    local running_pid
+    running_pid=$(pgrep -f "kdbx-vault-sync.sh" | grep -v "^$$\$" | head -1)
+    if [ -n "${running_pid}" ]; then
+        log_message "PAUSED: a sync run is still in progress (pid ${running_pid}) — left alone to finish; no new runs will start."
+    fi
+    date '+paused at %Y-%m-%d %H:%M:%S' > "${PAUSED_FLAG_PATH}"
+    log_message "Run './kdbx-vault-sync.sh resume' to restart the schedule."
+}
+
+# Resume the scheduled sync after `pause`: reload the launchd job. Because the
+# job plist uses RunAtLoad, the reload triggers a sync run immediately, then
+# the usual 60s interval continues.
+cmd_resume() {
+    if [ ! -f "${LAUNCHD_PLIST_PATH}" ]; then
+        log_message "ERROR: no launchd job registered (${LAUNCHD_PLIST_PATH}) — run './kdbx-vault-sync.sh init-background' first."
+        exit 1
+    fi
+    rm -f "${PAUSED_FLAG_PATH}"
+    # Clear any half-loaded state first, so `load -w` cannot fail with
+    # "already loaded" after an interrupted pause.
+    launchctl bootout "${LAUNCHD_JOB_ID}" 2>/dev/null
+    launchctl load -w "${LAUNCHD_PLIST_PATH}"
+    log_message "RESUMED: launchd job ${LAUNCHD_JOB_NAME} reloaded — a sync run fires immediately (RunAtLoad), then every 60s."
+}
+
 # ------------------------------------------------------------------ main
 
 case "$1" in
@@ -815,6 +990,8 @@ case "$1" in
     status)          cmd_status ;;
     resolve)         shift; cmd_resolve "$1" ;;
     remove)          shift; cmd_remove "$1" ;;
+    pause)           cmd_pause ;;
+    resume)          cmd_resume ;;
     init-app)        cmd_init_app ;;
     init-background) cmd_init_background ;;
     *)               cmd_run ;;

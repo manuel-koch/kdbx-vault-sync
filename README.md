@@ -84,6 +84,19 @@ To resolve:
                                      # drops state entry. Local file is NOT deleted.
 ```
 
+### Pausing and resuming the schedule
+
+```zsh
+./kdbx-vault-sync.sh pause    # no more scheduled runs; a run already in
+                              # progress finishes on its own (never killed)
+./kdbx-vault-sync.sh resume   # reloads the job; a sync run fires immediately,
+                              # then the usual 60 s interval continues
+```
+
+While paused, manual runs (`./kdbx-vault-sync.sh` with no args) still work on
+demand, and `./kdbx-vault-sync.sh status` shows a note that the schedule is
+paused.
+
 ## Commands
 
 | Command | Description |
@@ -94,15 +107,30 @@ To resolve:
 | *(no args)* | One sync run (push/pull/conflict detection) — what launchd executes every 60 s. |
 | `resolve FILE` | After a conflict and manual KeePassXC merge: push the merged file, adopt as new baseline. |
 | `remove FILE` | Stop syncing FILE: backs up both copies, deletes the remote file, drops the state entry. Local file is NOT deleted. |
+| `pause` | Stop the scheduled sync: unloads the launchd job (no further runs fire). A run already in progress is NOT interrupted — it finishes on its own. A marker file records the paused state (survives reboots, shown by `status`). |
+| `resume` | Restart the scheduled sync after `pause`: removes the paused marker, reloads the launchd job — a sync run fires immediately (RunAtLoad), then every 60 s. |
 | `init-app` | Build the launchd `.app` launcher (macOS requires a signed binary). |
 | `init-background` | Register the launchd job (60 s interval). |
 
 ## Managing the launchd job
 
+**Prefer the script's own commands** — they wrap everything below and get the
+details right (a run in progress is never interrupted; resume triggers an
+immediate run):
+
+```zsh
+./kdbx-vault-sync.sh pause     # stop scheduled runs (recommended)
+./kdbx-vault-sync.sh resume    # restart scheduled runs (recommended)
+```
+
+### Under the hood: raw launchctl
+
 Each vault directory gets its own launchd job. The `<hash>` in the service
 label is the MD5 of `<vault-dir>/kdbx-vault-sync.sh` (the path as invoked,
 symlink **not** resolved), making the label unique per vault directory.
-Compute it and find your jobs:
+`pause`/`resume` are equivalent to the bootout/load pair below, but with the
+safety details above; you only need these raw commands for troubleshooting —
+for example when a job seems stuck and you want to inspect or force-remove it.
 
 ```zsh
 # Compute the label for the current vault directory:
@@ -115,10 +143,10 @@ launchctl list | grep kdbx-vault-sync
 # inspect the vault-sync job
 launchctl print     "gui/$(id -u)/${LABEL}"     
 
-# stop the sync job, but keep it
+# stop the sync job, but keep it (equivalent to: ./kdbx-vault-sync.sh pause)
 launchctl bootout   "gui/$(id -u)/${LABEL}"     
 
-# resume a stopped sync job
+# resume a stopped sync job (equivalent to: ./kdbx-vault-sync.sh resume)
 launchctl load -w   ~/Library/LaunchAgents/${LABEL}.plist
 
 # stop a sync job permanently and remove it
