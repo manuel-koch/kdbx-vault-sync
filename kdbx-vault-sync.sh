@@ -40,6 +40,8 @@
 #        echo 'REMOTE_ALIAS="my-remote:"' > .kdbx-vault-sync.conf
 #      REMOTE_ALIAS names the rclone remote (with optional subpath) this
 #      vault syncs to. The script refuses to run without it — no fallback.
+#      Optionally set CONSECUTIVE_FAILURES_TO_IGNORE to silence transient
+#      sync-failure alerts for that many failed invocations (default: 0).
 #   4. Before init: make sure local and remote hold the SAME (most current)
 #      content — if they diverged while no sync was running, reconcile by
 #      hand first (open both in KeePassXC and merge), otherwise init will
@@ -123,6 +125,11 @@ require_valid_config() {
         echo "       Add a line like:  REMOTE_ALIAS=\"my-remote:\"" >&2
         exit 1
     fi
+    CONSECUTIVE_FAILURES_TO_IGNORE="${CONSECUTIVE_FAILURES_TO_IGNORE:-0}"
+    if [[ ! "${CONSECUTIVE_FAILURES_TO_IGNORE}" == <-> ]]; then
+        echo "ERROR: CONSECUTIVE_FAILURES_TO_IGNORE must be a non-negative integer" >&2
+        exit 1
+    fi
     REMOTE_BACKUP_ROOT="${REMOTE_ALIAS}.kdbx-vault-sync-backups/$(hostname -s)"
 }
 
@@ -149,6 +156,7 @@ LAUNCHD_PLIST_PATH="${HOME}/Library/LaunchAgents/${LAUNCHD_JOB_NAME}.plist"
 STATE_FILE_PATH="${SCRIPT_DIR}/.kdbx-vault-sync.state"
 LOCAL_BACKUP_DIR="${SCRIPT_DIR}/.kdbx-vault-sync-backups"
 PAUSED_FLAG_PATH="${SCRIPT_DIR}/.kdbx-vault-sync.paused"
+CONSECUTIVE_FAILURES_FILE_PATH="${SCRIPT_DIR}/.kdbx-vault-sync.consecutive-failures"
 
 # Re-alert interval for persistent problems (conflicts, failures). An unset
 # variable would evaluate as 0 in zsh arithmetic and re-alert on EVERY run,
@@ -202,6 +210,40 @@ clear_notification_flag() {
     setopt local_options null_glob
     rm -f "${SCRIPT_DIR}/.kdbx-vault-sync.notified-${1}"-*
     rm -f "${SCRIPT_DIR}/.kdbx-vault-sync.notified-${1}"
+}
+
+# Record one result per script invocation. Individual file failures only
+# increment failure_count; this counter advances once after the whole run.
+record_sync_result() {
+    local result="$1" immediate_alert_text="${2:-}" consecutive_failures=0 temp_counter_file
+    if [ "${result}" = "failure" ]; then
+        if [ -f "${CONSECUTIVE_FAILURES_FILE_PATH}" ]; then
+            consecutive_failures=$(cat "${CONSECUTIVE_FAILURES_FILE_PATH}")
+            if [[ ! "${consecutive_failures}" == <-> ]]; then
+                log_message "WARN: invalid failure counter; resetting it"
+                consecutive_failures=0
+            fi
+        fi
+        consecutive_failures=$((10#${consecutive_failures} + 1))
+        temp_counter_file="${CONSECUTIVE_FAILURES_FILE_PATH}.tmp"
+        if ! printf '%s\n' "${consecutive_failures}" > "${temp_counter_file}" ||
+           ! mv "${temp_counter_file}" "${CONSECUTIVE_FAILURES_FILE_PATH}"; then
+            rm -f "${temp_counter_file}"
+            log_message "WARN: could not persist consecutive failure counter"
+        fi
+
+        if [ -n "${immediate_alert_text}" ]; then
+            notify_once "sync-immediate" "${immediate_alert_text}"
+        elif (( consecutive_failures > 10#${CONSECUTIVE_FAILURES_TO_IGNORE} )); then
+            notify_once "sync-failed" \
+                "Vault Sync: sync failed ${consecutive_failures} consecutive run(s). Check the sync log for details."
+        else
+            log_message "WARN: sync failed ${consecutive_failures} consecutive run(s); alert suppressed (configured to ignore ${CONSECUTIVE_FAILURES_TO_IGNORE})"
+        fi
+    else
+        rm -f "${CONSECUTIVE_FAILURES_FILE_PATH}" "${CONSECUTIVE_FAILURES_FILE_PATH}.tmp"
+        clear_notification_flag "sync"
+    fi
 }
 
 # Print the paths of all syncable vault files in the script directory.
@@ -479,6 +521,7 @@ cmd_run() {
             rmdir "${lock_file}" 2>/dev/null
             if ! mkdir "${lock_file}" 2>/dev/null; then
                 log_message "ERROR: could not re-acquire lock ${lock_file} — skipping this run"
+                notify_once "sync-lock-failed" "Vault Sync: could not acquire the sync lock; this run was skipped."
                 exit 1
             fi
         else
@@ -564,8 +607,6 @@ for e in entries:
             transferred_count=$((transferred_count+1))
         else
             log_message "ERROR: could not pull remote-only file ${remote_name}"
-            notify_once "${remote_name}-adopt-failed" \
-                "Vault Sync: FAILED to pull new remote file ${remote_name}."
             failure_count=$((failure_count+1))
         fi
     done <<< "${remote_listing}"
@@ -593,8 +634,6 @@ for e in entries:
         # any other transient failure and retry on the next run.
         if [ "${current_remote_stat}" = "ERROR" ]; then
             log_message "ERROR: could not query the remote for ${vault_file_name} — skipping this file this run"
-            notify_once "${vault_file_name}-remote-error" \
-                "Vault Sync: could not reach the remote to check ${vault_file_name} — will retry"
             failure_count=$((failure_count+1))
             continue
         fi
@@ -652,7 +691,6 @@ for e in entries:
                 clear_notification_flag "${vault_file_name}"
             else
                 log_message "ERROR: push failed for ${vault_file_name}"
-                notify_once "${vault_file_name}-push-failed" "Vault Sync: push FAILED for ${vault_file_name}"
                 failure_count=$((failure_count+1))
             fi
 
@@ -724,7 +762,6 @@ for e in entries:
                     clear_notification_flag "${vault_file_name}"
                 else
                     log_message "ERROR: pull failed for ${vault_file_name}"
-                    notify_once "${vault_file_name}-pull-failed" "Vault Sync: pull FAILED for ${vault_file_name}"
                     failure_count=$((failure_count+1))
                 fi
             fi
@@ -757,6 +794,11 @@ for e in entries:
 
     if [ ${transferred_count} -eq 0 ] && [ ${conflict_count} -eq 0 ] && [ ${failure_count} -eq 0 ]; then
         log_message "All ${unchanged_count} vault file(s) in sync — nothing to do."
+    fi
+    if [ ${failure_count} -gt 0 ]; then
+        record_sync_result failure "${immediate_failure_alert:-}"
+    else
+        record_sync_result success
     fi
     [ ${conflict_count} -gt 0 ] && exit 2
     [ ${failure_count} -gt 0 ] && exit 1
